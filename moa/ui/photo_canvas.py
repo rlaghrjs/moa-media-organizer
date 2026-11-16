@@ -6,15 +6,26 @@ class PhotoCanvas(QGraphicsView):
     zoomChanged=Signal(str)
     def __init__(self,parent=None):
         super().__init__(parent);self.scene_object=QGraphicsScene(self);self.setScene(self.scene_object)
+        self.allow_upscale=False
         self.item=QGraphicsPixmapItem();self.scene_object.addItem(self.item);self.fitting=True
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform);self.setDragMode(self.DragMode.ScrollHandDrag)
         self.setBackgroundBrush(Qt.GlobalColor.black);self.setTransformationAnchor(self.ViewportAnchor.AnchorUnderMouse)
     def set_photo(self,pixmap):
         self.item.setPixmap(pixmap);self.item.setRotation(0);self.fit()
+    def set_frame(self, pixmap):
+        if self.item.pixmap().size() != pixmap.size():
+            self.set_photo(pixmap)
+        else:
+            self.item.setPixmap(pixmap)
+
     def fit(self):
         self.fitting=True;self.resetTransform();self.setSceneRect(self.item.sceneBoundingRect())
-        if not self.item.pixmap().isNull():self.fitInView(self.item,Qt.AspectRatioMode.KeepAspectRatio)
-        self.zoomChanged.emit('화면 맞춤')
+        if not self.item.pixmap().isNull():
+            self.fitInView(self.item, Qt.AspectRatioMode.KeepAspectRatio)
+            if not self.allow_upscale and self.transform().m11() > 1:
+                self.resetTransform()
+                self.centerOn(self.item)
+        self.zoomChanged.emit('원본 크기 · 100%' if self.transform().m11() == 1 else '화면 맞춤')
     def zoom(self,factor):
         current=self.transform().m11()
         if .03<current*factor<12:

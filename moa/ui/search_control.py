@@ -8,6 +8,7 @@ from moa.application.library_jobs import search_suggestions
 class SearchControl(QObject):
     chosen=Signal(str,str)
     edited=Signal()
+    cleared=Signal()
     def __init__(self,line,snapshot,context,panel,parent=None):
         super().__init__(parent);self.line=line;self.snapshot=snapshot;self.context=context;self.panel=panel;self.revision=0;self.future=None;self.waiting=False;self.closed=False;self.footer=None
         self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='MoaSearch')
@@ -21,7 +22,7 @@ class SearchControl(QObject):
         if text.strip():
             if self.panel.isVisible():self.panel.show_loading()
             self.timer.start()
-        else:self.timer.stop();self.panel.hide();self.chosen.emit('all','')
+        else:self.timer.stop();self.panel.hide();self.cleared.emit()
     def start(self):
         if self.closed or not self.line.text().strip():return
         if self.future is not None:self.waiting=True;return

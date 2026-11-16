@@ -3,7 +3,7 @@ from datetime import datetime
 import json
 import heapq
 from PySide6.QtCore import Qt,QAbstractTableModel,QModelIndex,QMimeData,QSize,QRect,Signal
-from PySide6.QtGui import QColor,QPainter,QPen,QFont,QPixmap
+from PySide6.QtGui import QColor,QPainter,QPen,QFont,QPixmap,QDrag
 from PySide6.QtWidgets import QStyledItemDelegate,QStyle,QTreeWidget
 from moa.contracts import MIME,is_video
 
@@ -74,22 +74,87 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.drawText(QRect(rect.x()+9,rect.y()+164,rect.width()-18,15),modified)
         painter.restore()
 
+HIERARCHY_MIME = 'application/x-moa-album-node'
+
+
 class AlbumTree(QTreeWidget):
-    filesDropped=Signal(str,list)
-    def __init__(self,parent=None):
-        super().__init__(parent);self.setUniformRowHeights(True);self.setAnimated(False);self.setWordWrap(False);self.setHeaderHidden(True);self.setAcceptDrops(True);self.setDropIndicatorShown(True);self.setDragDropMode(QTreeWidget.DragDropMode.DropOnly)
-    def dragEnterEvent(self,event):
-        if event.mimeData().hasFormat(MIME):event.acceptProposedAction()
-        else:event.ignore()
-    def dragMoveEvent(self,event):
-        item=self.itemAt(event.position().toPoint())
-        if item and item.data(0,Qt.ItemDataRole.UserRole) and item.data(0,Qt.ItemDataRole.UserRole)[0]=='album':event.setDropAction(Qt.DropAction.CopyAction);event.accept()
-        else:event.ignore()
-    def dropEvent(self,event):
-        item=self.itemAt(event.position().toPoint());data=item.data(0,Qt.ItemDataRole.UserRole) if item else None
-        if not data or data[0]!='album':event.ignore();return
+    filesDropped = Signal(str, list)
+    hierarchyDropped = Signal(str, str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.validate_hierarchy = None
+        self.setUniformRowHeights(True)
+        self.setAnimated(False)
+        self.setWordWrap(False)
+        self.setHeaderHidden(True)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QTreeWidget.DragDropMode.DragDrop)
+
+    def startDrag(self, supported_actions):
+        item = self.currentItem()
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not data or data[0] not in ('album', 'albumfolder'):
+            return
+        mime = QMimeData()
+        mime.setData(HIERARCHY_MIME, json.dumps({'kind':data[0], 'id':data[1]}).encode())
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(item.icon(0).pixmap(24,24))
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(MIME) or event.mimeData().hasFormat(HIERARCHY_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def drop_payload(self, mime, item):
+        if item is None:
+            return None
+        data = item.data(0, Qt.ItemDataRole.UserRole)
         try:
-            ids=json.loads(bytes(event.mimeData().data(MIME)))
-            if not isinstance(ids,list) or any(not isinstance(i,str) for i in ids):raise ValueError('잘못된 파일 선택')
-        except (ValueError,UnicodeError):event.ignore();return
-        self.filesDropped.emit(data[1],ids);event.setDropAction(Qt.DropAction.CopyAction);event.accept()
+            if mime.hasFormat(HIERARCHY_MIME):
+                payload = json.loads(bytes(mime.data(HIERARCHY_MIME)))
+                if not isinstance(payload, dict) or payload.get('kind') not in ('album','albumfolder') or not isinstance(payload.get('id'), str):
+                    return None
+                if data and data[0]=='albumfolder':
+                    target = data[1]
+                elif item.data(0,Qt.ItemDataRole.UserRole+1)=='albums':
+                    target = None
+                else:
+                    return None
+                if not self.validate_hierarchy or not self.validate_hierarchy(payload['kind'],payload['id'],target):
+                    return None
+                return ('hierarchy',payload,target)
+            if mime.hasFormat(MIME) and data and data[0]=='album':
+                ids = json.loads(bytes(mime.data(MIME)))
+                if isinstance(ids,list) and all(isinstance(ident,str) for ident in ids):
+                    return ('files',ids,data[1])
+        except (ValueError, UnicodeError):
+            pass
+        return None
+
+    def dragMoveEvent(self, event):
+        payload = self.drop_payload(event.mimeData(),self.itemAt(event.position().toPoint()))
+        if payload:
+            event.setDropAction(Qt.DropAction.MoveAction if payload[0]=='hierarchy' else Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        payload = self.drop_payload(event.mimeData(),self.itemAt(event.position().toPoint()))
+        if payload is None:
+            event.ignore()
+            return
+        kind, content, target = payload
+        if kind=='hierarchy':
+            self.hierarchyDropped.emit(content['kind'],content['id'],target)
+            event.setDropAction(Qt.DropAction.MoveAction)
+        else:
+            self.filesDropped.emit(target,content)
+            event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
