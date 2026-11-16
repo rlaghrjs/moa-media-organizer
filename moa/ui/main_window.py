@@ -13,6 +13,8 @@ from moa.storage.async_saver import LibrarySaver
 from moa.application.media_tasks import MediaTasks
 from moa.ui.media_model import MediaModel,ThumbnailDelegate,AlbumTree
 from moa.ui.viewer import Viewer
+from moa.ui.icons import album_icon
+from moa.application.gif_playback import GifPlayback
 from moa.ui.import_dialog import ExtensionDialog
 from moa.ui.search_control import SearchControl
 from moa.ui.search_panel import SearchPanel
@@ -65,19 +67,22 @@ class MainWindow(QMainWindow):
     def __init__(self,store,base):
         super().__init__();self.store=store;self.base=Path(base);self.view=('all',None);self.busy=False;self.future=None;self.viewer_id=None;self.preview_id=None;self.preview_key=None;self.closing=False;self.progress_events=queue.Queue();self.save_label='';self.album_items={};self.tree_nodes={};self.search_mode='all';self.pending_search=False
         self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='MoaFileIO')
-        self.setWindowTitle('모아 — 사진·영상 라이브러리');self.resize(store.settings['width'],store.settings['height']);self.setMinimumSize(1040,650);self.setStyleSheet(STYLE)
+        self.setWindowTitle('모아');self.resize(store.settings['width'],store.settings['height']);self.setMinimumSize(1040,650);self.setStyleSheet(STYLE)
         self.tasks=MediaTasks(store.directory/'cache',self);self.model=MediaModel(store,self.tasks,self)
         self.setup_menus();self.setup_layout()
-        self.tree_icons={name:self.style().standardIcon(kind) for name,kind in {'all':QStyle.StandardPixmap.SP_FileDialogContentsView,'folder':QStyle.StandardPixmap.SP_DirIcon,'album':QStyle.StandardPixmap.SP_DirOpenIcon}.items()}
+        self.tree_icons={name:self.style().standardIcon(kind) for name,kind in {'all':QStyle.StandardPixmap.SP_FileDialogContentsView,'folder':QStyle.StandardPixmap.SP_DirIcon}.items()}
+        self.tree_icons['albumfolder']=self.tree_icons['folder']
+        self.tree_icons['album']=album_icon()
         self.tasks.ready.connect(self.asset_ready)
         self.saver=LibrarySaver(store,self.executor,self);self.saver.changed.connect(self.save_changed);self.saver.failed.connect(self.save_failed);self.saver.idle.connect(self.save_idle)
         QApplication.instance().installEventFilter(self)
         self.poll_timer=QTimer(self);self.poll_timer.timeout.connect(self.poll_operations);self.poll_timer.start(100)
         self.search_control=SearchControl(self.search,self.store.snapshot,lambda:self.view,self.search_panel,self)
-        self.search_control.chosen.connect(self.apply_search);self.search_control.edited.connect(self.search_edited)
+        self.search_control.chosen.connect(self.apply_search);self.search_control.edited.connect(self.search_edited);self.search_control.cleared.connect(self.clear_search)
         self.tree.itemExpanded.connect(self.expand_folder);self.tree.itemCollapsed.connect(self.collapse_folder)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu);self.tree.customContextMenuRequested.connect(self.tree_context_menu)
-        self.tree.currentItemChanged.connect(self.navigation_changed);self.tree.filesDropped.connect(self.album_drop)
+        self.tree.currentItemChanged.connect(self.navigation_changed);self.tree.filesDropped.connect(self.album_drop);self.tree.hierarchyDropped.connect(self.move_hierarchy)
+        self.tree.validate_hierarchy=self.can_move_hierarchy
         self.selection=QItemSelectionModel(self.model,self);self.grid.setSelectionModel(self.selection);self.table.setSelectionModel(self.selection);self.selection.selectionChanged.connect(self.selection_changed)
         self.grid.doubleClicked.connect(lambda index:self.open_viewer(index.data(Qt.ItemDataRole.UserRole)));self.table.doubleClicked.connect(lambda index:self.open_viewer(index.data(Qt.ItemDataRole.UserRole)))
         self.grid.verticalScrollBar().valueChanged.connect(self.scrolled)
@@ -85,6 +90,12 @@ class MainWindow(QMainWindow):
         self.tree_timer=QTimer(self);self.tree_timer.setSingleShot(True);self.tree_timer.timeout.connect(self.tree_batch)
         self.expand_timer=QTimer(self);self.expand_timer.setSingleShot(True);self.expand_timer.timeout.connect(self.drain_expansions);self.expand_queue=[];self.loading_key=None;self.listing_revision=0
         self.navigation_timer=QTimer(self);self.navigation_timer.setSingleShot(True);self.navigation_timer.setInterval(45);self.navigation_timer.timeout.connect(self.refresh)
+        for listing in (self.grid, self.table):
+            listing.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            listing.customContextMenuRequested.connect(lambda point, view=listing: self.file_context_menu(view, point))
+            shortcut = QShortcut(QKeySequence('Delete'), listing)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self.remove_from_album)
         self.rebuild_tree(done=self.refresh)
         for key,callback in [('Escape',self.escape_viewer),('F11',self.toggle_fullscreen),('Alt+Left',lambda:self.step_viewer(-1)),('Alt+Right',lambda:self.step_viewer(1)),('Ctrl+O',self.import_folder),('F5',self.reload_files),('F2',self.rename_selected_file)]:
             shortcut=QShortcut(QKeySequence(key),self);shortcut.activated.connect(callback)
@@ -94,8 +105,8 @@ class MainWindow(QMainWindow):
     def setup_menus(self):
         self.setMenuBar(HoverMenuBar(self));bar=self.menuBar()
         file=bar.addMenu('파일');self.action(file,'폴더 불러오기…',self.import_folder);self.action(file,'ZIP 사진 불러오기…',self.import_zip);self.action(file,'새로고침 (F5)',self.reload_files);self.action(file,'선택 파일 열기',lambda:self.open_viewer());self.action(file,'탐색기에서 위치 열기',self.reveal_selected);self.rename_action=self.action(file,'실제 파일 이름 변경 (F2)…',self.rename_selected_file);file.addSeparator();self.move_action=self.action(file,'실제 파일 이동…',self.move_selected);self.action(file,'최근 이동·이름 변경 취소',self.undo_move);file.addSeparator();self.action(file,'종료',self.close)
-        classify=bar.addMenu('분류');self.action(classify,'새 앨범…',self.new_album);self.action(classify,'현재 앨범 이름 변경…',self.rename_album);self.action(classify,'현재 앨범 삭제…',self.delete_album);self.action(classify,'선택 파일을 앨범에 추가…',self.add_to_album);self.action(classify,'현재 앨범에서 제외',self.remove_from_album);classify.addSeparator();self.action(classify,'태그 편집…',self.edit_tags)
-        view=bar.addMenu('보기');self.paths_action=self.action(view,'왼쪽 실제 폴더 경로 표시',self.toggle_folders,True,self.store.settings['show_folders']);self.info_action=self.action(view,'오른쪽 미리보기 · 정보 표시',lambda checked:self.info.setVisible(checked),True,True)
+        classify=bar.addMenu('분류');self.action(classify,'새 앨범…',self.new_album);self.action(classify,'새 앨범 폴더…',lambda:self.new_album_folder());self.action(classify,'현재 앨범 이름 변경…',self.rename_album);self.action(classify,'현재 앨범 삭제…',self.delete_album);self.action(classify,'현재 앨범을 폴더로 이동…',self.move_album_dialog);self.action(classify,'선택 파일을 앨범에 추가…',self.add_to_album);self.remove_action=self.action(classify,'현재 앨범에서 제외',self.remove_from_album);classify.addSeparator();self.action(classify,'태그 편집…',self.edit_tags)
+        view=bar.addMenu('보기');self.paths_action=self.action(view,'실제 폴더 표시',self.toggle_folders,True,self.store.settings['show_folders']);self.info_action=self.action(view,'미리보기 표시',self.toggle_info,True,True)
         view.addSeparator();group=QActionGroup(self);group.setExclusive(True)
         for text,value in [('큰 아이콘',False),('자세히',True)]:
             a=self.action(view,text,lambda checked,v=value:self.change_mode(v),True,self.store.settings['details']==value);group.addAction(a)
@@ -107,14 +118,14 @@ class MainWindow(QMainWindow):
     def setup_layout(self):
         central=QWidget();layout=QVBoxLayout(central);layout.setContentsMargins(0,0,0,0);layout.setSpacing(0);self.setCentralWidget(central)
         top=QWidget();top.setStyleSheet('background:#f7f9fc;border-bottom:1px solid #e4e9f0;');row=QHBoxLayout(top);row.setContentsMargins(20,15,20,15)
-        brand=QLabel('모아');brand.setStyleSheet('font-size:21px;font-weight:600;color:#2865a7;border:0;');row.addWidget(brand);tagline=QLabel('사진 · 영상 라이브러리');tagline.setStyleSheet('color:#7c8999;border:0;');row.addSpacing(8);row.addWidget(tagline);row.addStretch()
-        self.reload_button=QPushButton('↻ 새로고침');self.reload_button.setToolTip('현재 폴더 또는 등록된 폴더의 파일 변경을 확인합니다 (F5)');self.reload_button.clicked.connect(self.reload_files);row.addWidget(self.reload_button)
+        brand=QLabel('모아');brand.setStyleSheet('font-size:21px;font-weight:600;color:#2865a7;border:0;');row.addWidget(brand);tagline=QLabel('사진 · 영상');tagline.setStyleSheet('color:#7c8999;border:0;');row.addSpacing(8);row.addWidget(tagline);row.addStretch()
+        self.reload_button=QPushButton('↻ 새로고침');self.reload_button.setToolTip('새로고침 (F5)');self.reload_button.clicked.connect(self.reload_files);row.addWidget(self.reload_button)
         self.search_kind=QLabel('');self.search_kind.setStyleSheet('color:#2865a7;border:0;');row.addWidget(self.search_kind)
-        self.search=QLineEdit();self.search.setPlaceholderText('태그·이름 검색 → 제안 선택 또는 Enter');self.search.setMinimumWidth(260);self.search.setMaximumWidth(390);row.addWidget(self.search);layout.addWidget(top)
+        self.search=QLineEdit();self.search.setPlaceholderText('이름 또는 태그 검색');self.search.setMinimumWidth(260);self.search.setMaximumWidth(390);row.addWidget(self.search);layout.addWidget(top)
         self.search_panel=SearchPanel(central,self.search);self.search_bar=top
         self.splitter=QSplitter();layout.addWidget(self.splitter,1)
         self.tree=AlbumTree();self.tree.setMinimumWidth(180);self.tree.setMaximumWidth(420);self.splitter.addWidget(self.tree)
-        center=QWidget();v=QVBoxLayout(center);v.setContentsMargins(20,18,20,14);v.setSpacing(14)
+        center=QWidget();v=QVBoxLayout(center);self.center_layout=v;v.setContentsMargins(20,18,20,14);v.setSpacing(14)
         self.location=QLabel('라이브러리 / 모든 파일');self.location.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);self.location.setStyleSheet('color:#748195;font-size:11px;');v.addWidget(self.location)
         self.pages=QStackedWidget();v.addWidget(self.pages,1)
         self.library_page=QWidget();listing=QVBoxLayout(self.library_page);listing.setContentsMargins(0,0,0,0);listing.setSpacing(13)
@@ -122,18 +133,25 @@ class MainWindow(QMainWindow):
         self.browser=QStackedWidget();listing.addWidget(self.browser,1)
         self.grid=QListView();self.grid.setModel(self.model);self.grid.setViewMode(QListView.ViewMode.IconMode);self.grid.setResizeMode(QListView.ResizeMode.Adjust);self.grid.setMovement(QListView.Movement.Static);self.grid.setWrapping(True);self.grid.setUniformItemSizes(True);self.grid.setLayoutMode(QListView.LayoutMode.Batched);self.grid.setBatchSize(250);self.grid.setGridSize(QSize(178,195));self.grid.setItemDelegate(ThumbnailDelegate(self.grid));self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection);self.grid.setDragEnabled(True);self.grid.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly);self.browser.addWidget(self.grid)
         self.table=QTableView();self.table.setModel(self.model);self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows);self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection);self.table.setDragEnabled(True);self.table.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly);self.table.setShowGrid(False);self.table.verticalHeader().hide();self.table.horizontalHeader().setStretchLastSection(True);self.table.setColumnWidth(0,250);self.table.setColumnWidth(1,165);self.table.setColumnWidth(2,80);self.table.setColumnWidth(3,85);self.table.horizontalHeader().sectionClicked.connect(self.heading_sort);self.browser.addWidget(self.table)
-        self.empty=QLabel('폴더를 불러와 사진과 영상을 정리해 보세요.\n\n파일 → 폴더 불러오기');self.empty.setWordWrap(True);self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter);self.empty.setStyleSheet('color:#7a8799;font-size:14px;');self.browser.addWidget(self.empty);self.pages.addWidget(self.library_page)
+        self.empty=QLabel('폴더를 추가해 보세요.');self.empty.setWordWrap(True);self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter);self.empty.setStyleSheet('color:#7a8799;font-size:14px;');self.browser.addWidget(self.empty);self.pages.addWidget(self.library_page)
         self.viewer=Viewer(self.tasks,self.base/'vendor'/'mpv'/'libmpv-2.dll',self);self.viewer.back.connect(self.back_to_list);self.viewer.step.connect(self.step_viewer);self.viewer.fill.connect(self.fill_viewer);self.viewer.fullscreen.connect(self.toggle_fullscreen);self.viewer.playback.connect(self.playback_changed);self.pages.addWidget(self.viewer)
         self.splitter.addWidget(center)
         self.info=QWidget();self.info.setMinimumWidth(235);self.info.setMaximumWidth(350);info=QVBoxLayout(self.info);info.setContentsMargins(18,20,18,20);info.setSpacing(13)
         label=QLabel('미리보기 · 정보');label.setStyleSheet('color:#6f7e91;');info.addWidget(label)
-        self.preview=QLabel('파일을 선택하세요');self.preview.setFixedHeight(175);self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter);self.preview.setWordWrap(True);self.preview.setStyleSheet('background:#f3f6fa;color:#8190a3;border-radius:5px;');info.addWidget(self.preview)
-        self.open_button=QPushButton('내부 뷰어로 열기');self.open_button.clicked.connect(lambda:self.open_viewer());info.addWidget(self.open_button)
+        self.preview=QLabel('파일 선택');self.preview.setFixedHeight(175);self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter);self.preview.setWordWrap(True);self.preview.setStyleSheet('background:#f3f6fa;color:#8190a3;border-radius:5px;');info.addWidget(self.preview)
+        self.preview_gif = GifPlayback(self.tasks, 400, self)
+        self.preview_gif.frameReady.connect(self.preview_gif_frame)
+        self.preview_gif.failed.connect(lambda message: self.preview.setText('GIF 미리보기 실패\n' + message))
+        self.open_button=QPushButton('열기');self.open_button.clicked.connect(lambda:self.open_viewer());info.addWidget(self.open_button)
         buttons=QHBoxLayout();reveal=QPushButton('탐색기 열기');reveal.clicked.connect(self.reveal_selected);rename=QPushButton('이름 변경');self.rename_button=rename;rename.clicked.connect(self.rename_selected_file);buttons.addWidget(reveal);buttons.addWidget(rename);info.addLayout(buttons)
         self.resolution=QLabel();self.resolution.hide();info.addWidget(self.resolution)
         self.details=QLabel();self.details.setWordWrap(True);self.details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);info.addWidget(self.details)
         self.add_button=QPushButton('앨범에 추가');self.add_button.clicked.connect(self.add_to_album);info.addWidget(self.add_button)
-        hint=QLabel('왼쪽 앨범에 파일을 드래그하면\n원본 위치를 유지하며 분류됩니다.');hint.setStyleSheet('color:#8190a3;font-size:11px;');hint.setWordWrap(True);info.addWidget(hint);info.addStretch();self.splitter.addWidget(self.info)
+        self.remove_button = QPushButton('현재 앨범에서 제외')
+        self.remove_button.setToolTip('선택한 파일의 현재 앨범 연결을 해제합니다.')
+        self.remove_button.clicked.connect(self.remove_from_album)
+        info.addWidget(self.remove_button)
+        info.addStretch();self.splitter.addWidget(self.info)
         self.splitter.setSizes([220,865,295]);self.statusBar().showMessage('준비');self.statusBar().setSizeGripEnabled(True)
         self.activity=QLabel();self.activity.setStyleSheet('background:transparent;color:#64758c;font-size:11px;');self.activity.hide()
         self.progress=QProgressBar();self.progress.setFixedSize(120,12);self.progress.setTextVisible(False);self.progress.hide()
@@ -200,6 +218,7 @@ class MainWindow(QMainWindow):
                 item.setData(0,Qt.ItemDataRole.UserRole,data)
                 if data==self.view:self.tree_selected=item
                 if data[0]=='album':self.album_items[data[1]]=item
+                if data[0]=='albumfolder':item.setExpanded(True)
                 if data[0] in ('folder','zip','zipfolder'):
                     item.setToolTip(0,str(data[1]))
                     if self.tree_children.get(key):item.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
@@ -224,7 +243,9 @@ class MainWindow(QMainWindow):
     def update_album_item(self,name):
         item=self.album_items.get(name)
         if item is None:
-            item=QTreeWidgetItem(self.tree_nodes['albums'],['']);item.setData(0,Qt.ItemDataRole.UserRole,('album',name));item.setIcon(0,self.tree_icons['album']);self.album_items[name]=item
+            folder=self.store.data.get('album_locations',{}).get(name)
+            parent=self.tree_nodes['albumfolder:'+folder] if folder else self.tree_nodes['albums']
+            item=QTreeWidgetItem(parent,['']);item.setData(0,Qt.ItemDataRole.UserRole,('album',name));item.setIcon(0,self.tree_icons['album']);self.album_items[name]=item;self.tree_nodes['album:'+name]=item
         item.setText(0,f"{name}   {len(self.store.data['albums'][name])}")
 
     def navigation_changed(self,item,previous=None):
@@ -253,12 +274,18 @@ class MainWindow(QMainWindow):
 
     def apply_listing(self,ids,old):
         self.tasks.new_generation();self.selection.blockSignals(True);self.model.reset(ids)
+        if self.pages.currentWidget() is self.viewer:
+            if self.viewer_id in ids:
+                self.viewer.update_navigation(ids.index(self.viewer_id), len(ids))
+                self.viewer.asset_ready('')
+            else:
+                self.back_to_list()
         for row,ident in enumerate(ids) if old else ():
             if ident in old:self.selection.select(self.model.index(row,0),QItemSelectionModel.SelectionFlag.Select|QItemSelectionModel.SelectionFlag.Rows)
         self.selection.blockSignals(False);category,value=self.view
-        self.heading.setText(value if category=='album' else '모든 파일' if category=='all' else Path(value[1]).name if category=='zipfolder' else Path(value).name)
-        self.location.setText('라이브러리 / 모든 파일' if category=='all' else '앨범 / '+str(value) if category=='album' else ('ZIP / '+str(value[0])+'!/'+str(value[1])) if category=='zipfolder' else ('ZIP / '+str(value)) if category=='zip' else str(value));self.location.setToolTip(self.location.text())
-        self.empty.setText('검색 결과가 없습니다.' if self.search.text().strip() else '이 앨범에는 파일이 없습니다. 왼쪽 앨범에 파일을 드래그해 추가하세요.' if category=='album' else '폴더를 불러와 사진과 영상을 정리해 보세요.\n\n파일 → 폴더 불러오기')
+        self.heading.setText(self.album_folder_label(value) if category=='albumfolder' else value if category=='album' else '모든 파일' if category=='all' else Path(value[1]).name if category=='zipfolder' else Path(value).name)
+        self.location.setText('앨범 폴더 / '+self.album_folder_label(value) if category=='albumfolder' else '라이브러리 / 모든 파일' if category=='all' else '앨범 / '+str(value) if category=='album' else ('ZIP / '+str(value[0])+'!/'+str(value[1])) if category=='zipfolder' else ('ZIP / '+str(value)) if category=='zip' else str(value));self.location.setToolTip(self.location.text())
+        self.empty.setText('검색 결과가 없습니다.' if self.search.text().strip() else '앨범이 비어 있습니다.' if category=='album' else '폴더를 추가해 보세요.')
         self.count.setText(f'{len(ids)}개 항목');self.change_mode(self.store.settings['details'],save=False);self.selection_changed()
 
     def item_sort_key(self,ident):
@@ -288,20 +315,45 @@ class MainWindow(QMainWindow):
     def scrolled(self):self.tasks.new_generation();self.asset_ready('');self.scroll_timer.start()
     def selection_changed(self,*_):
         ids=self.selected_ids();self.preview_id=ids[0] if ids else None;self.preview_key=None;self.resolution.hide()
+        in_album = self.view[0] == 'album'
+        self.remove_button.setVisible(in_album)
+        self.remove_button.setEnabled(in_album and bool(ids))
+        self.remove_action.setEnabled(in_album and bool(ids))
+        if not ids or self.pages.currentWidget() is self.viewer:
+            self.preview_gif.stop()
+        elif Path(self.store.data['files'][ids[0]]['path']).suffix.lower() != '.gif':
+            self.preview_gif.stop()
         editable=bool(ids) and not any(self.store.data['files'][i].get('archive') for i in ids)
         self.rename_button.setEnabled(editable and len(ids)==1);self.rename_action.setEnabled(editable and len(ids)==1);self.move_action.setEnabled(editable)
         self.open_button.setEnabled(bool(ids));self.add_button.setEnabled(bool(ids))
-        if not ids:self.preview.clear();self.preview.setText('파일을 선택하세요');self.details.clear()
+        if not ids:self.preview.clear();self.preview.setText('파일 선택');self.details.clear()
         else:
             item=self.store.data['files'][ids[0]];albums=[name for name,members in self.store.data['albums'].items() if ids[0] in members]
             self.details.setText(Path(item['path']).name+f"\n\n{Path(item['path']).suffix.upper()} · {item.get('size',0)/1048576:.1f} MB\n\n앨범\n"+(', '.join(albums) or '아직 분류하지 않음')+'\n\n태그\n'+(', '.join(item['tags']) or '없음')+'\n\n실제 파일 위치\n'+'\n'.join(textwrap.wrap((item['archive']+'\n내부 경로: '+item['member']) if item.get('archive') else str(Path(item['path']).parent),width=32,break_long_words=True,break_on_hyphens=False))+(f'\n\n{len(ids)}개 선택' if len(ids)>1 else ''))
             self.asset_ready('')
-        if not self.busy:self.statusBar().showMessage(f'{len(self.model.ids)}개 항목 · {len(ids)}개 선택  |  앨범 분류는 원본 위치 유지')
+        if not self.busy:self.statusBar().showMessage(f'{len(self.model.ids)}개 항목 · {len(ids)}개 선택')
+    def toggle_info(self, checked):
+        self.info.setVisible(checked)
+        if checked:
+            self.asset_ready('')
+        else:
+            self.preview_gif.stop()
+
     def asset_ready(self,key):
+        if not self.info_action.isChecked():
+            self.preview_gif.stop()
+            return
         if not self.preview_id or self.preview_id not in self.store.data['files']:return
         item=self.store.data['files'][self.preview_id]
         if item.get('missing'):
             self.preview.clear();self.preview.setText('파일을 찾을 수 없습니다.\n새로고침으로 경로를 확인하세요.');return
+        if Path(item['path']).suffix.lower() == '.gif' and self.pages.currentWidget() is not self.viewer:
+            if self.preview_gif.source_key != self.tasks.key(item,0):
+                self.preview.setText('GIF 미리보기 준비 중…')
+                self.resolution.setText('해상도 확인 중…')
+                self.resolution.show()
+                self.preview_gif.open(item)
+            return
         wanted=self.tasks.key(item,400)
         if key and key!=wanted:return
         pixmap=self.tasks.request(item,400,priority=1)
@@ -311,16 +363,27 @@ class MainWindow(QMainWindow):
         if pixmap is not None:
             self.preview.setPixmap(pixmap.scaled(max(170,self.preview.width()-6),170,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation));self.preview_key=wanted
         else:self.preview.clear();self.preview.setText('미리보기 지원 없음\n내부 뷰어로 열어 보세요.' if wanted in self.tasks.errors else '미리보기 준비 중…')
+    def preview_gif_frame(self, pixmap, width, height):
+        self.preview.setPixmap(pixmap.scaled(
+            max(170, self.preview.width()-6), 170,
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        ))
+        self.resolution.setText(f'해상도  {width} × {height}')
+        self.resolution.show()
+        if self.preview_id:
+            self.preview_key = self.tasks.key(self.store.data['files'][self.preview_id],400)
+
     def open_viewer(self,ident=None):
         if self.busy:return
         if ident is None:
             ids=self.selected_ids();ident=ids[0] if ids else None
         if not ident or ident not in self.model.ids:return
+        self.preview_gif.stop()
         self.viewer_id=ident;self.pages.setCurrentWidget(self.viewer);self.tasks.new_generation();self.viewer.open(self.store.data['files'][ident],self.model.ids.index(ident),len(self.model.ids));self.asset_ready('');self.viewer.setFocus(Qt.FocusReason.OtherFocusReason)
     def back_to_list(self):
         if not hasattr(self,'viewer'):return
         if self.isFullScreen():self.toggle_fullscreen()
-        self.viewer.stop();self.pages.setCurrentWidget(self.library_page);self.viewer_id=None;self.tree.show();self.info.setVisible(self.info_action.isChecked());self.viewer.fill_button.setChecked(False);self.viewer.fill_button.setText('화면 채우기');self.grid.viewport().update()
+        self.viewer.stop();self.pages.setCurrentWidget(self.library_page);self.viewer_id=None;self.tree.show();self.info.setVisible(self.info_action.isChecked());self.viewer.fill_button.setChecked(False);self.viewer.fill_button.setText('화면 채우기');self.grid.viewport().update();self.asset_ready('')
     def step_viewer(self,delta):
         if self.viewer_id not in self.model.ids:return
         index=self.model.ids.index(self.viewer_id)+delta
@@ -346,6 +409,10 @@ class MainWindow(QMainWindow):
             self.search_bar.show()
             self.statusBar().show()
             self.viewer.fill_button.show()
+            self.location.show()
+            self.center_layout.setContentsMargins(20,18,20,14)
+            self.center_layout.setSpacing(14)
+            self.viewer.set_fullscreen_mode(False)
             self.viewer.fullscreen_button.setText('전체 화면 (F11)')
             self.fill_viewer()
         else:
@@ -354,17 +421,29 @@ class MainWindow(QMainWindow):
             for widget in (self.menuBar(),self.search_bar,self.statusBar(),self.tree,self.info,self.viewer.fill_button):
                 widget.hide()
             self.viewer.fullscreen_button.setText('전체 화면 종료 (Esc)')
+            self.location.hide()
+            self.center_layout.setContentsMargins(0,0,0,0)
+            self.center_layout.setSpacing(0)
             self.showFullScreen()
+            self.viewer.set_fullscreen_mode(True)
         self.viewer.setFocus()
 
     def playback_changed(self,playing):self.tasks.playing=playing
     def require_selection(self):
         ids=self.selected_ids()
-        if not ids:QMessageBox.information(self,'파일 선택','먼저 파일을 선택하세요. Ctrl/Shift로 여러 파일을 선택할 수 있습니다.')
+        if not ids:QMessageBox.information(self,'파일 선택','파일을 선택하세요.')
         return ids
-    def new_album(self):
+    def new_album(self, folder=None):
+        if self.busy:return
         name,ok=QInputDialog.getText(self,'새 앨범','앨범 이름:')
-        if ok and name.strip():self.store.album(name);self.update_album_item(name.strip())
+        if ok and name.strip():
+            existed = name.strip() in self.store.data['albums']
+            self.store.album(name)
+            if not existed:
+                target=folder if isinstance(folder,str) else self.view[1] if self.view[0]=='albumfolder' else None
+                if target:self.store.move_album(name.strip(),target)
+            self.update_album_item(name.strip())
+            if self.view[0] == 'albumfolder':self.refresh()
 
     def add_to_album(self):
         ids=self.require_selection()
@@ -373,17 +452,44 @@ class MainWindow(QMainWindow):
         if ok and name.strip():self.album_drop(name.strip(),ids)
     def album_drop(self,name,ids):
         if self.busy:return
-        added=self.store.album(name,ids);self.search_control.invalidate();self.update_album_item(name)
+        existed = name in self.store.data['albums']
+        added=self.store.album(name,ids)
+        if not existed and self.view[0] == 'albumfolder':self.store.move_album(name,self.view[1])
+        self.search_control.invalidate();self.update_album_item(name)
         if self.view==('album',name):
             needle=self.search.text().strip().casefold()
             visible=[ident for ident in added if matches(self.store.data['files'][ident],needle,self.search_mode)]
             self.model.insert_sorted(visible,self.item_sort_key,self.store.settings['descending']);self.count.setText(f'{len(self.model.ids)}개 항목');self.change_mode(self.store.settings['details'],save=False)
-        self.selection_changed();self.statusBar().showMessage(f'{len(added)}개 파일을 «{name}» 앨범에 추가했습니다 · 원본 위치 유지',7000)
+        if self.view[0]=='albumfolder':self.refresh()
+        self.selection_changed();self.statusBar().showMessage(f'{len(added)}개 파일을 «{name}» 앨범에 추가했습니다',7000)
+
+    def file_context_menu(self, listing, point):
+        if self.busy or self.view[0] != 'album':
+            return
+        index = listing.indexAt(point)
+        if not index.isValid():
+            return
+        if index.data(Qt.ItemDataRole.UserRole) not in self.selected_ids():
+            self.selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+        menu = QMenu(listing)
+        menu.addAction('현재 앨범에서 제외', self.remove_from_album)
+        menu.exec(listing.viewport().mapToGlobal(point))
 
     def remove_from_album(self):
-        if self.view[0]!='album':QMessageBox.information(self,'앨범 선택','왼쪽에서 앨범을 선택하세요.');return
-        ids=self.require_selection()
-        if ids:self.store.remove_members(self.view[1],ids);self.update_album_item(self.view[1]);self.refresh()
+        if self.busy or self.view[0] != 'album':
+            return
+        viewing = self.pages.currentWidget() is self.viewer
+        ids = [self.viewer_id] if viewing and self.viewer_id else self.selected_ids()
+        if not ids:
+            return
+        name = self.view[1]
+        if viewing and self.viewer_id in ids:
+            self.back_to_list()
+        self.store.remove_members(name, ids)
+        self.search_control.invalidate()
+        self.update_album_item(name)
+        self.refresh()
+        self.statusBar().showMessage(f'{len(ids)}개 파일을 «{name}» 앨범에서 제외했습니다.', 6000)
 
     def edit_tags(self):
         ids=self.require_selection()
@@ -497,13 +603,24 @@ class MainWindow(QMainWindow):
         if self.saver.pending:
             self.closing=True;self.saver.flush(force=True);self.show_activity('분류 정보를 저장한 뒤 종료합니다…');event.ignore();return
         self.closing=False;self.tree_timer.stop();self.expand_timer.stop();self.navigation_timer.stop();QApplication.instance().removeEventFilter(self)
-        geometry=self.normalGeometry() if self.isFullScreen() or self.isMaximized() else self.geometry();self.store.settings['width']=geometry.width();self.store.settings['height']=geometry.height();self.store.save_settings();self.poll_timer.stop();self.search_control.close();self.saver.close();self.viewer.close_service();self.tasks.close();self.executor.shutdown(wait=False,cancel_futures=True);event.accept()
+        geometry=self.normalGeometry() if self.isFullScreen() or self.isMaximized() else self.geometry();self.store.settings['width']=geometry.width();self.store.settings['height']=geometry.height();self.store.save_settings();self.poll_timer.stop();self.search_control.close();self.preview_gif.close();self.saver.close();self.viewer.close_service();self.tasks.close();self.executor.shutdown(wait=False,cancel_futures=True);event.accept()
 
     def eventFilter(self,watched,event):
-        if event.type()==QEvent.Type.KeyPress and self.pages.currentWidget() is self.viewer and not self.busy and QApplication.activeModalWidget() is None and QApplication.activePopupWidget() is None:
+        viewing=self.pages.currentWidget() is self.viewer
+        local=isinstance(watched,QWidget) and watched.window() is self
+        if viewing and local and event.type()==QEvent.Type.MouseMove:
+            self.viewer.pointer_activity(QCursor.pos())
+        elif viewing and local and event.type() in (QEvent.Type.MouseButtonPress,QEvent.Type.Wheel,QEvent.Type.KeyPress):
+            self.viewer.activity()
+        if viewing and not self.busy and QApplication.activeModalWidget() is None and QApplication.activePopupWidget() is None:
             focus=QApplication.focusWidget()
-            editing=isinstance(focus,(QLineEdit,QTextEdit,QPlainTextEdit,QAbstractSpinBox,QSlider))
-            if not editing and event.modifiers() in (Qt.KeyboardModifier.NoModifier,Qt.KeyboardModifier.KeypadModifier):
+            typing=isinstance(focus,(QLineEdit,QTextEdit,QPlainTextEdit,QAbstractSpinBox))
+            plain=event.type() in (QEvent.Type.ShortcutOverride,QEvent.Type.KeyPress) and event.modifiers() in (Qt.KeyboardModifier.NoModifier,Qt.KeyboardModifier.KeypadModifier)
+            if plain and not typing and event.key()==Qt.Key.Key_Space and self.viewer.current and is_video(self.viewer.current['path']):
+                if event.type()==QEvent.Type.ShortcutOverride:event.accept()
+                elif not event.isAutoRepeat():self.viewer.toggle_play()
+                return True
+            if event.type()==QEvent.Type.KeyPress and not typing and not isinstance(focus,QSlider) and event.modifiers() in (Qt.KeyboardModifier.NoModifier,Qt.KeyboardModifier.KeypadModifier):
                 if event.key()==Qt.Key.Key_Left:self.step_viewer(-1);return True
                 if event.key()==Qt.Key.Key_Right:self.step_viewer(1);return True
         return super().eventFilter(watched,event)
@@ -511,8 +628,17 @@ class MainWindow(QMainWindow):
     def search_edited(self):
         self.search_mode='all';self.search_kind.clear()
 
+    def clear_search(self):
+        self.search_control.invalidate()
+        self.search_mode = 'all'
+        self.search_kind.clear()
+        self.refresh()
+
     def apply_search(self,kind,query):
         self.search_control.invalidate();self.search.blockSignals(True);self.search.setText(query);self.search.blockSignals(False)
+        if not query.strip():
+            self.clear_search()
+            return
         self.search_mode=kind;self.search_kind.setText({'tag':'[태그]','name':'[이름]'}.get(kind,''));self.back_to_list();self.refresh()
 
     def selected_album(self):
@@ -553,11 +679,180 @@ class MainWindow(QMainWindow):
         else:self.selection_changed()
         self.statusBar().showMessage('앨범을 삭제했습니다. 원본 파일은 유지됩니다.',6000)
 
+    def album_folder_label(self, ident):
+        folders = self.store.data.get('album_folders', {})
+        folder = folders[ident]
+        parent = folder.get('parent')
+        return folders[parent]['name'] + ' / ' + folder['name'] if parent else folder['name']
+
+    def new_album_folder(self, parent=None):
+        if self.busy:
+            return
+        name, ok = QInputDialog.getText(self, '앨범 폴더 만들기', '폴더 이름:')
+        if ok:
+            try:
+                ident = self.create_album_folder(name, parent)
+                self.tree.setCurrentItem(self.tree_nodes['albumfolder:'+ident])
+            except ValueError as error:
+                QMessageBox.warning(self, '앨범 폴더', str(error))
+
+    def create_album_folder(self, name, parent=None):
+        ident = self.store.album_folder(name, parent)
+        parent_item = self.tree_nodes['albumfolder:'+parent] if parent else self.tree_nodes['albums']
+        item = QTreeWidgetItem(parent_item, [name.strip()])
+        item.setData(0, Qt.ItemDataRole.UserRole, ('albumfolder', ident))
+        item.setData(0, Qt.ItemDataRole.UserRole+1, 'albumfolder:'+ident)
+        item.setIcon(0, self.tree_icons['albumfolder'])
+        item.setExpanded(True)
+        parent_item.setExpanded(True)
+        self.tree_nodes['albumfolder:'+ident] = item
+        return ident
+
+    def rename_album_folder(self, ident):
+        folder = self.store.data['album_folders'][ident]
+        name, ok = QInputDialog.getText(self, '앨범 폴더 이름 변경', '새 이름:', text=folder['name'])
+        if ok:
+            try:
+                self.store.album_folder(name, folder.get('parent'), ident)
+                self.tree_nodes['albumfolder:'+ident].setText(0, name.strip())
+                if self.view[0] == 'albumfolder':self.refresh()
+            except ValueError as error:
+                QMessageBox.warning(self, '앨범 폴더', str(error))
+
+    def move_album_dialog(self, name=None):
+        if self.busy:
+            return
+        name = name if isinstance(name, str) else self.selected_album()
+        if not name:
+            return
+        folders = sorted(self.store.data.get('album_folders', {}), key=lambda ident:natural(self.album_folder_label(ident)))
+        choices = ['[앨범 최상위]'] + ['폴더 · '+self.album_folder_label(ident) for ident in folders]
+        current = self.store.data.get('album_locations', {}).get(name)
+        initial = folders.index(current)+1 if current in folders else 0
+        choice, ok = QInputDialog.getItem(self, '앨범 위치 이동', '이동할 위치:', choices, initial, False)
+        if ok:
+            index = choices.index(choice)
+            self.move_album_to(name, folders[index-1] if index else None)
+
+    def move_album_to(self, name, folder=None):
+        self.store.move_album(name, folder)
+        item = self.album_items[name]
+        target = self.tree_nodes['albumfolder:'+folder] if folder else self.tree_nodes['albums']
+        self.tree.blockSignals(True)
+        item.parent().takeChild(item.parent().indexOfChild(item))
+        target.addChild(item)
+        target.setExpanded(True)
+        if self.view == ('album',name):self.tree.setCurrentItem(item)
+        self.tree.blockSignals(False)
+        self.search_control.invalidate()
+        if self.view[0] == 'albumfolder':self.refresh()
+
+    def move_album_folder_dialog(self, ident):
+        folders = self.store.data['album_folders']
+        parents = sorted((key for key, folder in folders.items() if key != ident and folder.get('parent') is None), key=lambda key:natural(folders[key]['name']))
+        choices = ['[앨범 최상위]'] + ['폴더 · '+folders[key]['name'] for key in parents]
+        current = folders[ident].get('parent')
+        initial = parents.index(current)+1 if current in parents else 0
+        choice, ok = QInputDialog.getItem(self, '앨범 폴더 위치 이동', '이동할 위치:', choices, initial, False)
+        if ok:
+            index = choices.index(choice)
+            try:
+                self.move_album_folder_to(ident, parents[index-1] if index else None)
+            except ValueError as error:
+                QMessageBox.warning(self, '앨범 폴더', str(error))
+
+    def move_album_folder_to(self, ident, parent=None):
+        folder = self.store.data['album_folders'][ident]
+        self.store.album_folder(folder['name'], parent, ident)
+        item = self.tree_nodes['albumfolder:'+ident]
+        target = self.tree_nodes['albumfolder:'+parent] if parent else self.tree_nodes['albums']
+        selected = self.tree.currentItem()
+        self.tree.blockSignals(True)
+        item.parent().takeChild(item.parent().indexOfChild(item))
+        target.addChild(item)
+        target.setExpanded(True)
+        if selected:self.tree.setCurrentItem(selected)
+        self.tree.blockSignals(False)
+        self.search_control.invalidate()
+        if self.view[0] == 'albumfolder':self.refresh()
+
+    def delete_album_folder(self, ident):
+        name = self.album_folder_label(ident)
+        answer = QMessageBox.question(self, '앨범 폴더 삭제', f'«{name}» 폴더와 하위 폴더를 삭제할까요?\n\n포함된 앨범은 앨범 최상위로 이동합니다.')
+        if answer == QMessageBox.StandardButton.Yes:
+            self.delete_album_folder_named(ident)
+
+    def delete_album_folder_named(self, ident):
+        folders = self.store.data['album_folders']
+        removed = {ident} | {key for key, folder in folders.items() if folder.get('parent') == ident}
+        affected = [name for name, folder in self.store.data.get('album_locations', {}).items() if folder in removed]
+        self.store.delete_album_folder(ident)
+        self.tree.blockSignals(True)
+        for name in affected:
+            item = self.album_items[name]
+            item.parent().takeChild(item.parent().indexOfChild(item))
+            self.tree_nodes['albums'].addChild(item)
+        item = self.tree_nodes['albumfolder:'+ident]
+        item.parent().takeChild(item.parent().indexOfChild(item))
+        for key in removed:self.tree_nodes.pop('albumfolder:'+key, None)
+        if self.view[0] == 'albumfolder' and self.view[1] in removed:
+            self.view = ('all',None)
+            self.tree.setCurrentItem(self.tree_nodes['all'])
+        elif self.view[0] == 'album':
+            self.tree.setCurrentItem(self.album_items[self.view[1]])
+        self.tree.blockSignals(False)
+        self.search_control.invalidate()
+        self.refresh()
+
     def tree_context_menu(self,position):
-        if self.busy:return
+        if self._busy:return
+        navigation_pending=self.navigation_timer.isActive()
+        self.navigation_timer.stop()
         item=self.tree.itemAt(position);data=item.data(0,Qt.ItemDataRole.UserRole) if item else None
-        if not data or data[0]!='album':return
-        menu=QMenu(self.tree);menu.addAction('앨범 이름 변경…',lambda:self.rename_album(data[1]));menu.addAction('앨범 삭제…',lambda:self.delete_album(data[1]));menu.exec(self.tree.viewport().mapToGlobal(position))
+        menu=QMenu(self.tree)
+        if data and data[0]=='album':
+            menu.addAction('새 앨범…',lambda:self.new_album(self.store.data.get('album_locations',{}).get(data[1]) or ''))
+            menu.addAction('앨범 이름 변경…',lambda:self.rename_album(data[1]))
+            menu.addAction('앨범을 폴더로 이동…',lambda:self.move_album_dialog(data[1]))
+            menu.addAction('앨범 삭제…',lambda:self.delete_album(data[1]))
+        elif data and data[0]=='albumfolder':
+            menu.addAction('새 앨범…',lambda:self.new_album(data[1]))
+            if self.store.data['album_folders'][data[1]].get('parent') is None:
+                menu.addAction('하위 폴더 만들기…',lambda:self.new_album_folder(data[1]))
+            menu.addAction('폴더 이름 변경…',lambda:self.rename_album_folder(data[1]))
+            menu.addAction('폴더 위치 이동…',lambda:self.move_album_folder_dialog(data[1]))
+            menu.addAction('폴더 삭제…',lambda:self.delete_album_folder(data[1]))
+        elif item is self.tree_nodes.get('albums') or item is None:
+            menu.addAction('새 앨범…',lambda:self.new_album(''))
+            menu.addAction('앨범 폴더 만들기…',lambda:self.new_album_folder())
+        else:
+            if navigation_pending:self.navigation_timer.start()
+            return
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+        if navigation_pending:self.refresh()
+
+    def can_move_hierarchy(self, kind, ident, target):
+        if self.busy:
+            return False
+        folders=self.store.data.get('album_folders',{})
+        if target is not None and target not in folders:
+            return False
+        if kind=='album':
+            return ident in self.store.data['albums']
+        if kind!='albumfolder' or ident not in folders or target==ident:
+            return False
+        if target is None:
+            return True
+        return folders[target].get('parent') is None and not any(folder.get('parent')==ident for folder in folders.values())
+
+    def move_hierarchy(self, kind, ident, target):
+        if not self.can_move_hierarchy(kind,ident,target):
+            return
+        try:
+            if kind=='album':self.move_album_to(ident,target)
+            else:self.move_album_folder_to(ident,target)
+        except ValueError as error:
+            QMessageBox.warning(self,'위치 이동',str(error))
 
     def single_file(self):
         if self.busy:return None

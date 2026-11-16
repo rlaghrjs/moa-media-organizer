@@ -19,11 +19,24 @@ class MediaTasks(QObject):
     def __init__(self,cache,parent=None):
         super().__init__(parent);self.cache=Path(cache);self.cache.mkdir(parents=True,exist_ok=True)
         ctx=multiprocessing.get_context('spawn')
+        self.gif_pool=None
         self.photo_pool=ProcessPoolExecutor(max_workers=max(1,min(2,(os.cpu_count() or 2)-1)),mp_context=ctx)
         self.video_pool=ProcessPoolExecutor(max_workers=1,mp_context=ctx)
         self.queue=[];self.serial=itertools.count();self.pending={};self.inflight={};self.memory=OrderedDict();self.errors={};self.bytes=0;self.generation=0;self.playing=False;self.closed=False
         self.timer=QTimer(self);self.timer.timeout.connect(self.poll);self.timer.start(70)
         self.dimensions=OrderedDict();self.active_archives={};self.worker_pids=set();self.last_prune=0
+    def gif_executor(self):
+        if self.closed:
+            raise RuntimeError('미디어 작업자가 종료되었습니다.')
+        if self.gif_pool is None:
+            self.gif_pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn'))
+        return self.gif_pool
+
+    def reset_gif_pool(self):
+        if self.gif_pool is not None:
+            self.gif_pool.terminate_workers()
+            self.gif_pool = None
+
     def key(self,item,size):
         source=f"v2|{item['path']}|{item.get('modified',0)}|{item.get('size',0)}|{size}"
         if size==400:source+="|resolution-v1"
@@ -129,6 +142,7 @@ class MediaTasks(QObject):
             try:path.unlink();total-=size
             except OSError:pass
     def close(self):
+        self.reset_gif_pool()
         self.closed=True;self.timer.stop();self.pending.clear();self.queue.clear()
         for future,_,_ in self.inflight.values():future.cancel()
         for pool in (self.photo_pool,self.video_pool):

@@ -4,7 +4,7 @@ import time
 from moa.video.player import Player
 
 def video_main(connection,dll,window,headless=False):
-    player=None;token=0;active=False
+    player=None;token=0;active=False;eof_handled=False
     try:
         import ctypes
         if os.name=='nt':
@@ -21,7 +21,7 @@ def video_main(connection,dll,window,headless=False):
                 if action=='quit':break
                 try:
                     if action=='load':
-                        token=request['token'];active=True
+                        token=request['token'];active=True;eof_handled=False
                         player.set('pause','yes');player.command('loadfile',request['path'],'replace')
                     elif action=='stop':active=False;player.command('stop')
                     elif action=='pause':player.set('pause','yes' if request['value'] else 'no')
@@ -31,6 +31,13 @@ def video_main(connection,dll,window,headless=False):
                 except Exception as error:connection.send({'type':'error','token':token,'message':str(error)})
             for kind,message in player.events():
                 if kind=='error' and active:connection.send({'type':'error','token':token,'message':message})
+            eof=active and player.flag('eof-reached')
+            if not eof:eof_handled=False
+            if eof and not eof_handled:
+                eof_handled=True
+                player.set('pause', 'yes')
+                player.command('seek', 0, 'absolute+exact')
+                connection.send({'type':'ended', 'token':token})
             if active and time.monotonic()-last>.18:
                 last=time.monotonic()
                 connection.send({'type':'state','token':token,'position':player.number('time-pos'),'duration':player.number('duration'),'paused':player.flag('pause',True),'volume':player.number('volume',70),'muted':player.flag('mute'),'output_width':player.number('osd-width'),'output_height':player.number('osd-height'),'pid':os.getpid()})

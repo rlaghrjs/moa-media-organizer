@@ -8,6 +8,7 @@ from moa.video.worker import video_main
 class VideoService(QObject):
     state=Signal(dict)
     error=Signal(str)
+    ended=Signal()
     def __init__(self,dll,parent=None):
         super().__init__(parent);self.dll=Path(dll);self.process=None;self.connection=None;self.token=0;self.active=False;self.started=0;self.ready=False
         self.timer=QTimer(self);self.timer.timeout.connect(self.poll);self.timer.start(60)
@@ -35,7 +36,8 @@ class VideoService(QObject):
                 event=self.connection.recv()
                 if event['type']=='ready':self.ready=True
                 elif event.get('token')==self.token and self.active:
-                    if event['type']=='error':self.error.emit(event['message']);self.active=False
+                    if event['type']=='ended':self.ended.emit()
+                    elif event['type']=='error':self.error.emit(event['message']);self.active=False
                     else:self.state.emit(event)
             if self.process and not self.process.is_alive() and self.active:
                 self.active=False;self.error.emit('영상 재생 프로세스가 종료되었습니다. 다시 열어 주세요.')

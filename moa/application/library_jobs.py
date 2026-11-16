@@ -24,9 +24,25 @@ def import_library(data,folder,directory,progress=None,extensions=None):
     report(progress,'라이브러리 저장 중…');write_snapshot(directory,data)
     return data,len(records),errors
 
+def album_folder_members(data, ident):
+    folders = data.get('album_folders', {})
+    included = {ident} | {key for key, folder in folders.items() if folder.get('parent') == ident}
+    return list(dict.fromkeys(file_id for name, folder in data.get('album_locations', {}).items()
+                             if folder in included for file_id in data['albums'].get(name, [])))
+
+
+def listing_candidates(data, view):
+    kind, value = view
+    if kind == 'album':
+        return data['albums'].get(value, [])
+    if kind == 'albumfolder':
+        return album_folder_members(data, value)
+    return data['files'].keys()
+
+
 def listing_ids(data,view,needle,sort,descending,progress=None,search_mode='all'):
     kind,value=view
-    candidates=data['albums'].get(value,[]) if kind=='album' else data['files'].keys()
+    candidates=listing_candidates(data,view)
     ids=[];total=len(candidates);accept=scope_matcher(view)
     for n,ident in enumerate(candidates):
         item=data['files'].get(ident)
@@ -76,7 +92,7 @@ def tree_plan(data,show_folders,progress=None):
     for item in data['files'].values():
         if item.get('archive'):archives.setdefault(item['archive'],set()).add(str(Path(item['member']).parent).replace('\\','/'))
     if archives:
-        entries.append(('archives',None,'ZIP 사진 · 읽기 전용',None,None))
+        entries.append(('archives',None,'ZIP',None,None))
         for archive,folders in sorted(archives.items(),key=lambda p:natural(p[0])):
             rootkey='zip:'+archive;entries.append((rootkey,'archives',Path(archive).name,('zip',archive),'folder'));known={'.':rootkey}
             for folder in sorted(folders,key=natural):
@@ -86,9 +102,16 @@ def tree_plan(data,show_folders,progress=None):
                     parent=known[current or '.'];current=(current+'/' if current else '')+part
                     if current not in known:
                         key=rootkey+'!/'+current;known[current]=key;entries.append((key,parent,part,('zipfolder',(archive,current)),'folder'))
-    entries.append(('albums',None,'앨범 · 원본 위치 유지',None,None))
+    entries.append(('albums',None,'앨범',None,None))
+    folders = data.get('album_folders', {})
+    ordered = sorted(folders.items(), key=lambda pair: (pair[1].get('parent') is not None, natural(pair[1]['name'])))
+    for ident, folder in ordered:
+        parent = 'albumfolder:'+folder['parent'] if folder.get('parent') else 'albums'
+        entries.append(('albumfolder:'+ident, parent, folder['name'], ('albumfolder', ident), 'albumfolder'))
     for name,members in sorted(data['albums'].items(),key=lambda pair:natural(pair[0])):
-        entries.append(('album:'+name,'albums',f'{name}   {len(members)}',('album',name),'album'))
+        folder = data.get('album_locations', {}).get(name)
+        parent = 'albumfolder:'+folder if folder else 'albums'
+        entries.append(('album:'+name,parent,f'{name}   {len(members)}',('album',name),'album'))
     return entries
 
 
@@ -103,7 +126,7 @@ def matches(item,query,mode='all'):
 def search_suggestions(data,view,query):
     needle=query.strip().casefold()
     if not needle:return []
-    kind,value=view;candidates=data['albums'].get(value,[]) if kind=='album' else data['files'].keys()
+    kind,value=view;candidates=listing_candidates(data,view)
     tags={};names={};total=0;accept=scope_matcher(view)
     for ident in candidates:
         item=data['files'].get(ident)

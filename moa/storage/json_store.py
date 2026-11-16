@@ -36,6 +36,19 @@ def validate(data):
     filters=data.setdefault('root_filters',{})
     if not isinstance(filters,dict) or any(not isinstance(root,str) or not isinstance(values,list) or any(not isinstance(v,str) for v in values) for root,values in filters.items()):
         raise ValueError('폴더별 확장자 설정이 올바르지 않습니다.')
+    folders = data.setdefault('album_folders', {})
+    locations = data.setdefault('album_locations', {})
+    if not isinstance(folders, dict) or not isinstance(locations, dict):
+        raise ValueError('앨범 폴더 정보가 올바르지 않습니다.')
+    for ident, folder in folders.items():
+        if not isinstance(ident, str) or not isinstance(folder, dict) or not isinstance(folder.get('name'), str):
+            raise ValueError('앨범 폴더 이름이 올바르지 않습니다.')
+    for folder in folders.values():
+        parent = folder.get('parent')
+        if parent is not None and (not isinstance(parent, str) or parent not in folders or folders[parent].get('parent') is not None):
+            raise ValueError('앨범 폴더는 최대 2단계까지 만들 수 있습니다.')
+    if any(name not in data['albums'] or not isinstance(ident, str) or ident not in folders for name, ident in locations.items()):
+        raise ValueError('앨범의 폴더 연결이 올바르지 않습니다.')
     return data
 
 class Store:
@@ -100,7 +113,8 @@ class Store:
         # Records and membership lists use copy-on-write, so background serialization
         # can keep these references while UI edits replace individual records.
         return {'version':1,'files':dict(self.data['files']),'albums':dict(self.data['albums']),
-                'moves':list(self.data['moves']),'roots':list(self.data['roots']),'root_filters':dict(self.data.get('root_filters',{}))}
+                'moves':list(self.data['moves']),'roots':list(self.data['roots']),'root_filters':dict(self.data.get('root_filters',{})),
+                'album_folders':dict(self.data.get('album_folders',{})), 'album_locations':dict(self.data.get('album_locations',{}))}
 
     def save(self):
         if self.save_handler:self.save_handler()
@@ -139,11 +153,53 @@ class Store:
         if new_name==name:return False
         if new_name in self.data['albums']:raise ValueError('같은 이름의 앨범이 이미 있습니다.')
         self.data['albums']={new_name if key==name else key:members for key,members in self.data['albums'].items()}
+        self.data['album_locations']={new_name if key==name else key:folder for key,folder in self.data.get('album_locations',{}).items()}
         self.save();return True
 
     def delete_album(self,name):
         if name not in self.data['albums']:raise ValueError('앨범이 없습니다.')
         self.data['albums']={key:members for key,members in self.data['albums'].items() if key!=name}
+        self.data['album_locations']={key:folder for key,folder in self.data.get('album_locations',{}).items() if key!=name}
+        self.save()
+
+    def album_folder(self, name, parent=None, ident=None):
+        name = name.strip()
+        folders = self.data.get('album_folders', {})
+        if not name:
+            raise ValueError('폴더 이름을 입력하세요.')
+        if '/' in name or '\\' in name:
+            raise ValueError('폴더 이름에는 경로 구분자를 사용할 수 없습니다.')
+        if parent is not None and (parent not in folders or folders[parent].get('parent') is not None):
+            raise ValueError('앨범 폴더는 최대 2단계까지 만들 수 있습니다.')
+        if ident is not None and ident not in folders:
+            raise ValueError('앨범 폴더가 없습니다.')
+        if any(key != ident and folder['name'] == name and folder.get('parent') == parent for key, folder in folders.items()):
+            raise ValueError('같은 위치에 같은 이름의 폴더가 있습니다.')
+        ident = ident or uuid.uuid4().hex
+        if parent == ident or (parent is not None and any(folder.get('parent') == ident for folder in folders.values())):
+            raise ValueError('하위 폴더가 있는 폴더는 1단계에 있어야 합니다.')
+        self.data['album_folders'] = {**folders, ident: {'name': name, 'parent': parent}}
+        self.save()
+        return ident
+
+    def move_album(self, name, folder=None):
+        if name not in self.data['albums']:
+            raise ValueError('앨범이 없습니다.')
+        if folder is not None and folder not in self.data.get('album_folders', {}):
+            raise ValueError('앨범 폴더가 없습니다.')
+        locations = {key: value for key, value in self.data.get('album_locations', {}).items() if key != name}
+        if folder is not None:
+            locations[name] = folder
+        self.data['album_locations'] = locations
+        self.save()
+
+    def delete_album_folder(self, ident):
+        folders = self.data.get('album_folders', {})
+        if ident not in folders:
+            raise ValueError('앨범 폴더가 없습니다.')
+        removed = {ident} | {key for key, folder in folders.items() if folder.get('parent') == ident}
+        self.data['album_folders'] = {key: folder for key, folder in folders.items() if key not in removed}
+        self.data['album_locations'] = {name: folder for name, folder in self.data.get('album_locations', {}).items() if folder not in removed}
         self.save()
 
     def remove_members(self,name,ids):
